@@ -40,7 +40,7 @@ Ext.define('MilestoneCFD', {
         Deft.Promise.all([
             this._loadMilestone(),
             this._loadPIsInMilestone(),
-            this._loadScheduleStateValues(),
+            this._loadScheduleStateValues()
         ]).then({
             success: function() {
                 this._addProjectCheckboxes();
