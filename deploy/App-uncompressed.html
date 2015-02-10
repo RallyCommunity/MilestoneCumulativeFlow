@@ -11,14 +11,7 @@
     extend: 'Rally.data.lookback.calculator.TimeSeriesCalculator',
 
     getMetrics: function () {
-        return  [
-            {
-                as: 'Scope',
-                field: 'Scope',
-                display: 'line',
-                f: 'sum'
-            }
-        ].concat(_.map(this.stateFieldValues, function (stateFieldValue) {
+        return _.map(this.stateFieldValues, function (stateFieldValue) {
                 return  {
                     field: 'PlanEstimate',
                     as: stateFieldValue,
@@ -27,61 +20,20 @@
                     filterValues: [stateFieldValue],
                     display: 'area'
                 };
-            }, this));
-    },
-
-    _getPreliminaryEstimateById: _.memoize(function (preliminaryEstimate) {
-        return _.find(this.preliminaryEstimates, function (pe) {
-            return Rally.util.Ref.getRelativeUri(pe) === Rally.util.Ref.getRelativeUri(preliminaryEstimate);
-        });
-    }),
-
-    _getChapterById: _.memoize(function (chapterId) {
-        return _.find(this.chapters, function (chapter) {
-            return chapter.getId() === chapterId;
-        });
-    }),
-
-    getDerivedFieldsOnInput: function () {
-        var self = this;
-        return [
-            {
-                "as": "Scope",
-                "f": function (snapshot) {
-                    if (snapshot.State) {
-                        var chapter = self._getChapterById(snapshot.ObjectID);
-                        var preliminaryEstimate = self._getPreliminaryEstimateById(chapter.get('PreliminaryEstimate'));
-                        return Math.max(preliminaryEstimate.get('Value'), snapshot.LeafStoryPlanEstimateTotal || 0);
-                    }
-                    return 0;
-                }
-            }
-        ];
-    },
-
-    getSummaryMetricsConfig: function () {
-        return [
-            {
-                'as': 'Scope_max',
-                'f': function (seriesData) {
-                    var max = 0, i = 0;
-                    for (i = 0; i < seriesData.length; i++) {
-                        if (seriesData[i].Scope > max) {
-                            max = seriesData[i].Scope;
-                        }
-                    }
-                    return max;
-                }
-            }
-        ];
+            }, this);
     },
 
     getDerivedFieldsAfterSummary: function () {
+        var stateFieldValues = this.stateFieldValues;
         return  [
             {
-                "as": "Ideal",
-                "f": function (row, index, summaryMetrics, seriesData) {
-                    var max = summaryMetrics.Scope_max,
+                as: 'Ideal',
+                f: function (row, index, summaryMetrics, seriesData) {
+                    var data = _.last(seriesData),
+                        max = _.reduce(_.filter(_.keys(data), function(key) {
+                            return _.contains(stateFieldValues, key); }), function(accum, key) {
+                            return accum + data[key];
+                        }, 0),
                         increments = seriesData.length - 1,
                         incrementAmount;
                     if (increments === 0) {
@@ -90,28 +42,22 @@
                     incrementAmount = max / increments;
                     return Math.floor(100 * (index * incrementAmount)) / 100;
                 },
-                "display": "line"
+                display: 'line'
+            },
+            {
+                as: 'Actual',
+                f: function(row, index, summaryMetrics, seriesData) {
+                    var today = Rally.util.DateTime.toIsoString(new Date());
+                    var endIndex = _.findIndex(seriesData, function(data) { return data.tick > today; });
+                    if(index <= endIndex) {
+                        var acceptedSeriesData = _.pluck(seriesData, 'Accepted');
+                        var slope = (acceptedSeriesData[0] - acceptedSeriesData[endIndex]) / (0 - endIndex);
+                        return index * slope;
+                    }
+                },
+                display: 'line'
             }
         ];
-    },
-
-    runCalculation: function (snapshots) {
-        var chartData = this.callParent(arguments);
-        var acceptedSeriesData = chartData.series[4].data;
-        var today = Rally.util.DateTime.toIsoString(new Date());
-        var endIndex = _.indexOf(chartData.categories, today.substring(0, today.indexOf('T')));
-        var slope = (acceptedSeriesData[0] - acceptedSeriesData[endIndex]) / (0 - endIndex);
-
-        chartData.series.push({
-            dashStyle: 'Solid',
-            name: 'Actual',
-            type: 'line',
-            data: _.map(chartData.categories, function (tick, i) {
-                return i * slope;
-            })
-        });
-
-        return chartData;
     }
 });
                 Ext.define('MilestoneCFD', {
@@ -155,9 +101,8 @@
     _load: function() {
         Deft.Promise.all([
             this._loadMilestone(),
-            this._loadChaptersInMilestone(),
+            this._loadPIsInMilestone(),
             this._loadScheduleStateValues(),
-            this._loadPreliminaryEstimateValues()
         ]).then({
             success: function() {
                 this._addProjectCheckboxes();
@@ -188,39 +133,43 @@
         });
     },
 
-    _loadChaptersInMilestone: function() {
-        var store = Ext.create('Rally.data.wsapi.Store', {
-            model: 'portfolioitem/chapter',
-            fetch: ['ObjectID', 'Project', 'Name', 'PreliminaryEstimate', 'ActualStartDate', 'PlannedEndDate', 'AcceptedLeafStoryPlanEstimateTotal', 'LeafStoryPlanEstimateTotal'],
+    _loadPIsInMilestone: function() {
+        return Ext.create('Rally.data.wsapi.Store', {
+            model: 'TypeDefinition',
+            fetch: ['TypePath'],
             filters: [
                 {
-                    property: 'Milestones',
-                    operator: 'contains',
-                    value: this._getMilestone()
+                    property: 'Parent.Name',
+                    value: 'Portfolio Item'
+                },
+                {
+                    property: 'Ordinal',
+                    value: 0
                 }
-            ],
-            context: {
-                project: null
-            },
-            limit: Infinity
-        });
-        return store.load().then({
+            ]
+        }).load().then({
             success: function(records) {
-                this.chapters = records;
-            },
-            scope: this
-        });
-    },
-
-    _loadPreliminaryEstimateValues: function () {
-        var store = Ext.create('Rally.data.wsapi.Store', {
-            model: 'preliminaryestimate',
-            fetch: ['Name', 'Value'],
-            limit: Infinity
-        });
-        return store.load().then({
-            success: function(records) {
-                this.preliminaryEstimates = records;
+                this.piType = records[0].get('TypePath');
+                return Ext.create('Rally.data.wsapi.Store', {
+                    model: this.piType,
+                    fetch: ['ObjectID', 'Project', 'Name', 'PreliminaryEstimate', 'ActualStartDate', 'PlannedEndDate', 'AcceptedLeafStoryPlanEstimateTotal', 'LeafStoryPlanEstimateTotal'],
+                    filters: [
+                        {
+                            property: 'Milestones',
+                            operator: 'contains',
+                            value: this._getMilestone()
+                        }
+                    ],
+                    context: {
+                        project: null
+                    },
+                    limit: Infinity
+                }).load().then({
+                    success: function(piRecords) {
+                        this.piRecords = piRecords;
+                    },
+                    scope: this
+                });
             },
             scope: this
         });
@@ -245,8 +194,8 @@
         if(this.down('checkboxgroup')) {
             this.down('checkboxgroup').destroy();
         }
-        var teams = _.reduce(this.chapters, function(projects, chapter) {
-            projects[Rally.util.Ref.getOidFromRef(chapter.get('Project'))] = chapter.get('Project');
+        var teams = _.reduce(this.piRecords, function(projects, piRecord) {
+            projects[Rally.util.Ref.getOidFromRef(piRecord.get('Project'))] = piRecord.get('Project');
             return projects;
         }, {});
         this.down('#header').add({
@@ -277,22 +226,19 @@
             calculatorConfig: {
                 stateFieldName: 'ScheduleState',
                 stateFieldValues: this.scheduleStateValues,
-                preliminaryEstimates: this.preliminaryEstimates,
-                startDate: _.min(_.compact(_.invoke(this.chapters, 'get', 'ActualStartDate'))),
-                endDate: _.max(_.compact(_.invoke(this.chapters, 'get', 'PlannedEndDate'))),
-                chapters: this.chapters,
+                startDate: _.min(_.compact(_.invoke(this.piRecords, 'get', 'ActualStartDate'))),
+                endDate: this.milestone.get('TargetDate'),
                 enableProjects: true
             },
-            chartConfig: this._getChartConfig(),
-            chartColors: ['#848689'].concat(Rally.ui.chart.Chart.prototype.chartColors)
+            chartConfig: this._getChartConfig()
         });
     },
 
     _getStoreConfig: function () {
         return {
             find: {
-                _TypeHierarchy: { '$in': [ 'HierarchicalRequirement', 'PortfolioItem/Chapter'] },
-                _ItemHierarchy: { '$in': _.invoke(this.chapters, 'getId')},
+                _TypeHierarchy: { '$in': [ 'HierarchicalRequirement'] },
+                _ItemHierarchy: { '$in': _.invoke(this.piRecords, 'getId')},
                 _ProjectHierarchy: { '$in': Ext.Array.from(this.down('checkboxgroup').getValue().project)}
             },
             fetch: ['ScheduleState', 'PlanEstimate', 'PortfolioItem', 'LeafStoryPlanEstimateTotal', 'State'],
@@ -309,15 +255,11 @@
      * Generate a valid Highcharts configuration object to specify the chart
      */
     _getChartConfig: function () {
-        var totalAcceptedPoints = _.reduce(this.chapters, function(total, chapter) {
-            return total + chapter.get('AcceptedLeafStoryPlanEstimateTotal');
+        var totalAcceptedPoints = _.reduce(this.piRecords, function(total, piRecord) {
+            return total + piRecord.get('AcceptedLeafStoryPlanEstimateTotal');
         },  0);
-        var totalPoints = _.reduce(this.chapters, function(total, chapter) {
-            var leafPlanTotal = chapter.get('LeafStoryPlanEstimateTotal');
-            var prelimEstValue = _.find(this.preliminaryEstimates, function(preliminaryEstimate) {
-                return Rally.util.Ref.getRelativeUri(preliminaryEstimate) === Rally.util.Ref.getRelativeUri(chapter.get('PreliminaryEstimate'));
-            });
-            return total + Math.max(leafPlanTotal, prelimEstValue.get('Value'));
+        var totalPoints = _.reduce(this.piRecords, function(total, piRecord) {
+            return total + piRecord.get('LeafStoryPlanEstimateTotal');
         },  0, this);
 
         return {
